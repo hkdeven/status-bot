@@ -56,6 +56,44 @@ function rollup (activities, users) {
   return [...groups.values()].sort((x, y) => new Date(y.latest) - new Date(x.latest))
 }
 
+function stripHtml (html) {
+  return String(html || '')
+    // Zoho stores mentions as zp[@zpuser#<id>#<name>]zp
+    .replace(/zp\[@zpuser#\d+#([^\]]+)\]zp/g, '@$1')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/(p|div|li)>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Comments live outside the activity feed, one endpoint per task, so only tasks
+// that actually moved in this window get looked up.
+async function fetchComments (token, portalId, targets, since) {
+  const out = []
+  const batchSize = 5
+  for (let i = 0; i < targets.length; i += batchSize) {
+    const batch = targets.slice(i, i + batchSize)
+    const results = await Promise.all(batch.map(async t => {
+      try {
+        const res = await get(token, `/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}/comments`)
+        return (res.comments || [])
+          .filter(c => new Date(c.created_time) >= since)
+          .map(c => ({ ...c, taskName: t.name, projectName: t.projectName, taskId: t.taskId, isMine: !!t.isMine }))
+      } catch {
+        return []
+      }
+    }))
+    out.push(...results.flat())
+  }
+  return out.sort((a, b) => new Date(b.created_time) - new Date(a.created_time))
+}
+
 function describe (g) {
   const what = g.a.activity_state === 'copy' ? 'created' : `${g.a.activity_state}d`.replace('eed', 'ed')
   const fields = g.fields.size ? ` (${[...g.fields].slice(0, 4).join(', ')}${g.fields.size > 4 ? ', ...' : ''})` : ''
@@ -116,12 +154,30 @@ export async function collectZoho ({ since, config }) {
     }
   }
 
+  // Comments on anything that moved, plus anything on your own plate.
+  const commentTargets = new Map()
+  for (const a of activities) {
+    if (a.activity !== 'task') continue
+    const projectName = names[String(a.project_id)] || `project ${a.project_id}`
+    if (excluded.includes(projectName)) continue
+    commentTargets.set(String(a.id), {
+      projectId: String(a.project_id), taskId: String(a.id), name: a.name, projectName
+    })
+  }
+
   // Tasks assigned to you, so the digest says what is on your plate, not just what moved.
   const mine = (await get(token, `/restapi/portal/${portalId}/mytasks/`, {
     index: '1', range: '100', status: 'open'
   })).tasks || []
   if (mine.length) {
     const touched = mine.filter(t => t.last_updated_time_long && new Date(t.last_updated_time_long) >= since)
+    for (const t of touched) {
+      if (!t.project?.id_string || !t.id_string) continue
+      commentTargets.set(String(t.id_string), {
+        projectId: String(t.project.id_string), taskId: String(t.id_string),
+        name: t.name, projectName: t.project.name, isMine: true
+      })
+    }
     const overdue = mine.filter(t => t.end_date_long && new Date(t.end_date_long) < new Date())
     body.push('### Your open tasks')
     body.push('')
@@ -139,6 +195,26 @@ export async function collectZoho ({ since, config }) {
     }
   }
 
-  const label = me ? 'Zoho Projects' : 'Zoho Projects'
-  return { title: label, configured: true, body, attention }
+  const targets = [...commentTargets.values()].slice(0, 60)
+  const comments = await fetchComments(token, portalId, targets, since)
+  if (comments.length) {
+    // Mentions carry the numeric user id, which beats matching on a name.
+    const tagsMe = c => me && new RegExp(`zpuser#${me.id}#`).test(String(c.comment || ''))
+    body.push('### Comments')
+    body.push('')
+    for (const c of comments.slice(0, 20)) {
+      const text = stripHtml(c.comment)
+      const mark = tagsMe(c) ? ' [tags you]' : ''
+      body.push(`- **${c.taskName}** (${c.projectName}), ${c.created_by?.full_name || 'someone'} (${clock(c.created_time)})${mark}: "${text.length > 220 ? text.slice(0, 220) + '...' : text}"`)
+    }
+    if (comments.length > 20) body.push(`- plus ${comments.length - 20} more`)
+    body.push('')
+
+    const flagged = comments.filter(c => tagsMe(c) || c.isMine)
+    if (flagged.length) {
+      attention.push(`${flagged.length} Zoho comment${flagged.length === 1 ? '' : 's'} name you or land on your tasks: ${[...new Set(flagged.slice(0, 4).map(c => c.taskName))].join(', ')}`)
+    }
+  }
+
+  return { title: 'Zoho Projects', configured: true, body, attention }
 }
