@@ -63,9 +63,12 @@ Secrets live in `.env` and cached OAuth tokens in `.tokens/`. Both are gitignore
 - **GitHub**: commits per branch with author and churn, open PRs and issues touched.
 - **Trello**: card actions, comments, comments that tag you, cards you were added
   to, your overdue and due soon cards.
-- **Zoho Projects**: portal wide activity rolled up per task, task comments with
-  mentions decoded, field changes on the fields in `zoho.watchFields`, and your
-  open tasks.
+- **Zoho Projects**: portal wide activity grouped by sprint tag, task comments
+  with mentions decoded, field changes on the fields in `zoho.watchFields`, and
+  your open tasks. `zoho.sprintTagPattern` decides which tag counts as the
+  sprint, default `SPRINT`. Sprint headings sort by the date in the tag name,
+  so `21 AUGUST SPRINT` comes before `28 AUGUST SPRINT`, and anything without a
+  sprint tag lands in one bucket at the end.
 - **Outlook**: inbox split into needs a reply, for information, and automated.
 
 Zoho never reports what a field changed to, only that it changed, so the bot

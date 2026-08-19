@@ -12,7 +12,7 @@ const fieldSnapshotPath = join(root, '.tokens', 'zoho-task-fields.json')
 
 // Zoho allows 100 requests per endpoint per two minutes, so anything per task is
 // rationed and anything that can be fetched per project is fetched per project.
-const CAPS = { tagLookups: 15, commentLookups: 30, projectPages: 3 }
+const CAPS = { tagLookups: 60, commentLookups: 30, projectPages: 3 }
 
 function makeClient (token, warnings) {
   return async function get (path, params = {}, { soft = false } = {}) {
@@ -116,15 +116,35 @@ async function fetchProjectTasks (get, portalId, projectIds) {
 }
 
 // Tags are not on any list endpoint and the tags API needs a scope we do not
-// hold, so they are read per task, only where the feed says a tag changed.
-async function fetchTags (get, portalId, targets) {
+// hold, so they are read one task at a time, in batches, up to the cap.
+async function fetchTags (get, portalId, targets, warnings) {
   const out = new Map()
-  for (const t of targets.slice(0, CAPS.tagLookups)) {
-    const res = await get(`/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}`, {}, { soft: true })
-    const task = Array.isArray(res) ? res[0] : (res?.tasks?.[0] || res)
-    if (task?.tags) out.set(t.taskId, task.tags.map(x => x.name).sort())
+  const list = targets.slice(0, CAPS.tagLookups)
+  if (targets.length > list.length) {
+    warnings.push(`Tags read for ${list.length} of ${targets.length} tasks, the rest are grouped as untagged to stay inside the Zoho rate limit`)
+  }
+  const batch = 5
+  for (let i = 0; i < list.length; i += batch) {
+    await Promise.all(list.slice(i, i + batch).map(async t => {
+      const res = await get(`/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}`, {}, { soft: true })
+      const task = Array.isArray(res) ? res[0] : (res?.tasks?.[0] || res)
+      if (task?.tags) out.set(t.taskId, task.tags.map(x => x.name).sort())
+    }))
   }
   return out
+}
+
+const MONTHS = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY',
+  'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER']
+
+// Sprint tags read like "21 AUGUST SPRINT", so they sort by date rather than
+// alphabetically. Anything unparseable falls to the end, in name order.
+function sprintOrder (tag, year) {
+  const m = /(\d{1,2})\s+([A-Z]+)/i.exec(tag)
+  if (!m) return Number.MAX_SAFE_INTEGER
+  const month = MONTHS.indexOf(m[2].toUpperCase())
+  if (month < 0) return Number.MAX_SAFE_INTEGER
+  return new Date(year, month, Number(m[1])).getTime()
 }
 
 async function fetchComments (get, portalId, targets, since) {
@@ -211,27 +231,6 @@ export async function collectZoho ({ since, config, commit }) {
   const body = []
   const attention = []
 
-  if (visible.length) {
-    const byProject = new Map()
-    for (const a of visible) {
-      const key = names[String(a.project_id)] || `project ${a.project_id}`
-      if (!byProject.has(key)) byProject.set(key, [])
-      byProject.get(key).push(a)
-    }
-    const movers = [...new Set(visible.map(a => users[String(a.user?.id)]).filter(Boolean))]
-    const edits = [...byProject.values()].reduce((n, list) => n + rollup(list, users).length, 0)
-    body.push(`${edits} edit${edits === 1 ? '' : 's'} across ${byProject.size} project${byProject.size === 1 ? '' : 's'} by ${movers.join(', ') || 'unknown'}.`)
-    body.push('')
-    for (const [project, list] of byProject) {
-      body.push(`### ${project}`)
-      body.push('')
-      const rolled = rollup(list, users)
-      for (const g of rolled.slice(0, 12)) body.push(`- ${describe(g)} (${clock(g.latest)})`)
-      if (rolled.length > 12) body.push(`- plus ${rolled.length - 12} more`)
-      body.push('')
-    }
-  }
-
   // Everything below works off the tasks that actually moved in this window.
   const taskTargets = new Map()
   for (const a of visible) {
@@ -251,7 +250,51 @@ export async function collectZoho ({ since, config, commit }) {
   const targets = [...taskTargets.values()]
   const projectIds = [...new Set(targets.map(t => t.projectId))]
   const projectTasks = await fetchProjectTasks(get, portalId, projectIds)
-  const tags = await fetchTags(get, portalId, targets.filter(t => t.tagChanged))
+  const tags = await fetchTags(get, portalId, targets, warnings)
+
+  // Activity is grouped by sprint tag, since that is how the work is planned.
+  // Everything without one lands in a single bucket at the end.
+  const sprintPattern = new RegExp(config.zoho?.sprintTagPattern || 'SPRINT', 'i')
+  const UNTAGGED = 'No sprint tag'
+  const sprintOf = taskId => (tags.get(taskId) || []).find(t => sprintPattern.test(t)) || UNTAGGED
+  const otherTags = taskId => (tags.get(taskId) || []).filter(t => !sprintPattern.test(t))
+
+  if (visible.length) {
+    const bySprint = new Map()
+    for (const a of visible) {
+      const key = a.activity === 'task' ? sprintOf(String(a.id)) : UNTAGGED
+      if (!bySprint.has(key)) bySprint.set(key, [])
+      bySprint.get(key).push(a)
+    }
+    const year = since.getFullYear()
+    const sprints = [...bySprint.keys()].sort((a, b) => {
+      if (a === UNTAGGED) return 1
+      if (b === UNTAGGED) return -1
+      return sprintOrder(a, year) - sprintOrder(b, year) || a.localeCompare(b)
+    })
+
+    const movers = [...new Set(visible.map(a => users[String(a.user?.id)]).filter(Boolean))]
+    const edits = [...bySprint.values()].reduce((n, list) => n + rollup(list, users).length, 0)
+    const named = sprints.filter(x => x !== UNTAGGED).length
+    body.push(`${edits} edit${edits === 1 ? '' : 's'} across ${named} sprint${named === 1 ? '' : 's'} by ${movers.join(', ') || 'unknown'}.`)
+    body.push('')
+
+    for (const sprint of sprints) {
+      const list = bySprint.get(sprint)
+      const rolled = rollup(list, users)
+      body.push(`### ${sprint} (${rolled.length} edit${rolled.length === 1 ? '' : 's'})`)
+      body.push('')
+      for (const g of rolled.slice(0, 15)) {
+        const target = taskTargets.get(String(g.a.id))
+        const project = target?.projectName || names[String(g.a.project_id)] || 'unknown project'
+        const extra = otherTags(String(g.a.id))
+        const extraText = extra.length ? `, tagged ${extra.join(', ')}` : ''
+        body.push(`- ${describe(g)} [${project}${extraText}] (${clock(g.latest)})`)
+      }
+      if (rolled.length > 15) body.push(`- plus ${rolled.length - 15} more`)
+      body.push('')
+    }
+  }
 
   const current = new Map()
   for (const t of targets) {
