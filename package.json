@@ -1,0 +1,13 @@
+{
+  "name": "status-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Daily status digest across GitHub, Outlook, Trello and Zoho Projects",
+  "bin": { "status-bot": "src/index.js" },
+  "scripts": {
+    "status": "node src/index.js",
+    "digest": "node src/index.js --write-state",
+    "today": "node src/index.js --since=today"
+  }
+}

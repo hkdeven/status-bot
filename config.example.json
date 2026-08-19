@@ -1,0 +1,20 @@
+{
+  "github": {
+    "repos": [
+      "your-org/your-repo",
+      "your-org/another-repo"
+    ]
+  },
+  "outlook": {
+    "yourAddresses": ["you@example.com"],
+    "maxMessages": 100
+  },
+  "trello": {
+    "boards": "all",
+    "dueSoonDays": 3
+  },
+  "zoho": {
+    "projects": "all",
+    "excludeProjects": ["Some Noisy Template Project"]
+  }
+}
