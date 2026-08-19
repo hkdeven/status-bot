@@ -6,7 +6,9 @@
     ]
   },
   "outlook": {
-    "yourAddresses": ["you@example.com"],
+    "yourAddresses": [
+      "you@example.com"
+    ],
     "maxMessages": 100
   },
   "trello": {
@@ -15,6 +17,13 @@
   },
   "zoho": {
     "projects": "all",
-    "excludeProjects": ["Some Noisy Template Project"]
+    "excludeProjects": [
+      "Some Noisy Template Project"
+    ],
+    "watchFields": [
+      "Expected Release Date",
+      "tags",
+      "status"
+    ]
   }
 }

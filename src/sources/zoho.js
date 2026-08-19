@@ -6,31 +6,46 @@ import { clock } from '../render.js'
 
 const API = 'https://projectsapi.zoho.com'
 const MODULES = ['project', 'task', 'bug', 'milestone']
+const DEFAULT_WATCH = ['Expected Release Date', 'tags', 'status']
 const projectCachePath = join(root, '.tokens', 'zoho-projects.json')
+const fieldSnapshotPath = join(root, '.tokens', 'zoho-task-fields.json')
 
-async function get (token, path, params = {}) {
-  const url = new URL(API + path)
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
-  const res = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${token}` } })
-  if (!res.ok) throw new Error(`Zoho ${path} returned ${res.status}`)
-  return res.json()
+// Zoho allows 100 requests per endpoint per two minutes, so anything per task is
+// rationed and anything that can be fetched per project is fetched per project.
+const CAPS = { tagLookups: 15, commentLookups: 30, projectPages: 3 }
+
+function makeClient (token, warnings) {
+  return async function get (path, params = {}, { soft = false } = {}) {
+    const url = new URL(API + path)
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
+    const res = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${token}` } })
+    if (res.status === 204) return null
+    const text = await res.text()
+    if (!res.ok) {
+      const throttled = text.includes('THROTTLES_LIMIT_EXCEEDED')
+      const message = throttled
+        ? `Zoho throttled ${path.replace(/\d{10,}/g, '<id>')}, some detail is missing from this digest`
+        : `Zoho ${path.replace(/\d{10,}/g, '<id>')} returned ${res.status}`
+      if (!soft) throw new Error(message)
+      if (!warnings.includes(message)) warnings.push(message)
+      return null
+    }
+    try { return JSON.parse(text) } catch { return null }
+  }
 }
 
-function loadProjectCache () {
-  if (!existsSync(projectCachePath)) return {}
-  try { return JSON.parse(readFileSync(projectCachePath, 'utf8')) } catch { return {} }
+function readJson (path) {
+  if (!existsSync(path)) return {}
+  try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} }
 }
 
-// Names are only resolved for projects that actually showed up, then cached,
-// so a portal with hundreds of contracts does not cost hundreds of calls.
-async function resolveProjects (token, portalId, wantedIds) {
-  const cache = loadProjectCache()
-  const missing = wantedIds.filter(id => !cache[id])
-  if (missing.length) {
-    for (let page = 0; page < 6 && missing.some(id => !cache[id]); page++) {
-      const list = await get(token, `/api/v3/portal/${portalId}/projects`, {
+async function resolveProjects (get, portalId, wantedIds) {
+  const cache = readJson(projectCachePath)
+  if (wantedIds.some(id => !cache[id])) {
+    for (let page = 0; page < 6 && wantedIds.some(id => !cache[id]); page++) {
+      const list = await get(`/api/v3/portal/${portalId}/projects`, {
         index: String(page * 100 + 1), range: '100'
-      })
+      }, { soft: true })
       if (!Array.isArray(list) || !list.length) break
       for (const p of list) cache[String(p.id)] = p.name
     }
@@ -39,8 +54,23 @@ async function resolveProjects (token, portalId, wantedIds) {
   return cache
 }
 
-// Zoho logs one activity per field, so a single edit can appear eight times.
-// Roll them up per item, per person, per action.
+function stripHtml (html) {
+  return String(html || '')
+    // Zoho stores mentions as zp[@zpuser#<id>#<name>]zp
+    .replace(/zp\[@zpuser#\d+#([^\]]+)\]zp/g, '@$1')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<\/(p|div|li)>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Zoho date custom fields come back as "08-21-2026 12:00:00 AM".
+const tidy = v => String(v).replace(/\s+12:00:00\s*AM$/i, '')
+
+// One activity row per changed field, so a single edit can appear eight times.
 function rollup (activities, users) {
   const groups = new Map()
   for (const a of activities) {
@@ -56,44 +86,6 @@ function rollup (activities, users) {
   return [...groups.values()].sort((x, y) => new Date(y.latest) - new Date(x.latest))
 }
 
-function stripHtml (html) {
-  return String(html || '')
-    // Zoho stores mentions as zp[@zpuser#<id>#<name>]zp
-    .replace(/zp\[@zpuser#\d+#([^\]]+)\]zp/g, '@$1')
-    .replace(/<br\s*\/?>/gi, ' ')
-    .replace(/<\/(p|div|li)>/gi, ' ')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-// Comments live outside the activity feed, one endpoint per task, so only tasks
-// that actually moved in this window get looked up.
-async function fetchComments (token, portalId, targets, since) {
-  const out = []
-  const batchSize = 5
-  for (let i = 0; i < targets.length; i += batchSize) {
-    const batch = targets.slice(i, i + batchSize)
-    const results = await Promise.all(batch.map(async t => {
-      try {
-        const res = await get(token, `/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}/comments`)
-        return (res.comments || [])
-          .filter(c => new Date(c.created_time) >= since)
-          .map(c => ({ ...c, taskName: t.name, projectName: t.projectName, taskId: t.taskId, isMine: !!t.isMine }))
-      } catch {
-        return []
-      }
-    }))
-    out.push(...results.flat())
-  }
-  return out.sort((a, b) => new Date(b.created_time) - new Date(a.created_time))
-}
-
 function describe (g) {
   const what = g.a.activity_state === 'copy' ? 'created' : `${g.a.activity_state}d`.replace('eed', 'ed')
   const fields = g.fields.size ? ` (${[...g.fields].slice(0, 4).join(', ')}${g.fields.size > 4 ? ', ...' : ''})` : ''
@@ -101,46 +93,132 @@ function describe (g) {
   return `${g.who} ${what} ${g.a.activity} **${g.a.name}**${fields}${times}`
 }
 
-export async function collectZoho ({ since, config }) {
+// Status and custom fields come from the project task list, one call per project.
+async function fetchProjectTasks (get, portalId, projectIds) {
+  const byTask = new Map()
+  for (const projectId of projectIds) {
+    for (let page = 0; page < CAPS.projectPages; page++) {
+      const res = await get(`/restapi/portal/${portalId}/projects/${projectId}/tasks/`, {
+        index: String(page * 100 + 1), range: '100'
+      }, { soft: true })
+      const tasks = res?.tasks || []
+      for (const t of tasks) {
+        const custom = {}
+        for (const f of t.custom_fields || []) custom[f.label_name] = f.value
+        byTask.set(String(t.id_string || t.id), {
+          name: t.name, projectId: String(projectId), status: t.status?.name || '', custom
+        })
+      }
+      if (tasks.length < 100) break
+    }
+  }
+  return byTask
+}
+
+// Tags are not on any list endpoint and the tags API needs a scope we do not
+// hold, so they are read per task, only where the feed says a tag changed.
+async function fetchTags (get, portalId, targets) {
+  const out = new Map()
+  for (const t of targets.slice(0, CAPS.tagLookups)) {
+    const res = await get(`/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}`, {}, { soft: true })
+    const task = Array.isArray(res) ? res[0] : (res?.tasks?.[0] || res)
+    if (task?.tags) out.set(t.taskId, task.tags.map(x => x.name).sort())
+  }
+  return out
+}
+
+async function fetchComments (get, portalId, targets, since) {
+  const out = []
+  const batch = 5
+  const list = targets.slice(0, CAPS.commentLookups)
+  for (let i = 0; i < list.length; i += batch) {
+    const results = await Promise.all(list.slice(i, i + batch).map(async t => {
+      const res = await get(`/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}/comments`, {}, { soft: true })
+      return (res?.comments || [])
+        .filter(c => new Date(c.created_time) >= since)
+        .map(c => ({ ...c, taskName: t.name, projectName: t.projectName, isMine: !!t.isMine }))
+    }))
+    out.push(...results.flat())
+  }
+  return out.sort((a, b) => new Date(b.created_time) - new Date(a.created_time))
+}
+
+function diffFields (current, snapshot, watch) {
+  const changes = []
+  for (const [taskId, now] of current) {
+    const before = snapshot[taskId]
+    for (const field of watch) {
+      if (field === 'tags') {
+        if (!now.tags) continue
+        const wasTags = before?.tags
+        if (!wasTags) {
+          if (now.tags.length) changes.push({ ...now, taskId, field, text: `tags are ${now.tags.join(', ')}`, isNew: true })
+          continue
+        }
+        const added = now.tags.filter(x => !wasTags.includes(x))
+        const removed = wasTags.filter(x => !now.tags.includes(x))
+        if (added.length || removed.length) {
+          const parts = []
+          if (added.length) parts.push(`added ${added.join(', ')}`)
+          if (removed.length) parts.push(`removed ${removed.join(', ')}`)
+          changes.push({ ...now, taskId, field, text: `tags ${parts.join(', ')}` })
+        }
+        continue
+      }
+      const nowValue = field === 'status' ? now.status : now.custom?.[field]
+      const wasValue = before ? (field === 'status' ? before.status : before.custom?.[field]) : undefined
+      if (nowValue == null || nowValue === '') continue
+      if (wasValue === undefined) {
+        changes.push({ ...now, taskId, field, text: `${field} is ${tidy(nowValue)}`, isNew: true })
+      } else if (nowValue !== wasValue) {
+        changes.push({ ...now, taskId, field, text: `${field} now ${tidy(nowValue)}, was ${wasValue ? tidy(wasValue) : 'empty'}` })
+      }
+    }
+  }
+  return changes
+}
+
+export async function collectZoho ({ since, config, commit }) {
   if (!process.env.ZOHO_REFRESH_TOKEN) {
     return { title: 'Zoho Projects', configured: false, setupHint: 'Add ZOHO_* values to .env.' }
   }
 
-  const token = await zohoAccessToken()
-  const portalId = process.env.ZOHO_PORTAL_ID ||
-    String((await get(token, '/api/v3/portals'))[0].id)
+  const warnings = []
+  const get = makeClient(await zohoAccessToken(), warnings)
+  const portalId = process.env.ZOHO_PORTAL_ID || String((await get('/api/v3/portals'))[0].id)
 
-  const userList = (await get(token, `/restapi/portal/${portalId}/users/`)).users || []
+  const userList = (await get(`/restapi/portal/${portalId}/users/`))?.users || []
   const users = Object.fromEntries(userList.map(u => [String(u.id), u.name]))
-  const me = userList.find(u => (u.email || '').toLowerCase() ===
-    (config.outlook?.yourAddresses?.[0] || '').toLowerCase())
+  const myEmail = (config.outlook?.yourAddresses?.[0] || '').toLowerCase()
+  const me = userList.find(u => (u.email || '').toLowerCase() === myEmail)
 
   const activities = []
   for (const module of MODULES) {
-    const res = await get(token, `/api/v3/portal/${portalId}/activities`, {
+    const res = await get(`/api/v3/portal/${portalId}/activities`, {
       module, action: 'updated', index: '1', range: '100'
-    })
-    for (const a of res.activities || []) {
+    }, { soft: true })
+    for (const a of res?.activities || []) {
       if (new Date(a.action_time) >= since) activities.push(a)
     }
   }
   activities.sort((a, b) => new Date(b.action_time) - new Date(a.action_time))
 
-  const names = await resolveProjects(token, portalId, [...new Set(activities.map(a => String(a.project_id)))])
-
+  const names = await resolveProjects(get, portalId, [...new Set(activities.map(a => String(a.project_id)))])
   const excluded = config.zoho?.excludeProjects || []
+  const watch = config.zoho?.watchFields || DEFAULT_WATCH
+  const visible = activities.filter(a => !excluded.includes(names[String(a.project_id)]))
+
   const body = []
   const attention = []
 
-  if (activities.length) {
+  if (visible.length) {
     const byProject = new Map()
-    for (const a of activities) {
+    for (const a of visible) {
       const key = names[String(a.project_id)] || `project ${a.project_id}`
-      if (excluded.includes(key)) continue
       if (!byProject.has(key)) byProject.set(key, [])
       byProject.get(key).push(a)
     }
-    const movers = [...new Set(activities.map(a => users[String(a.user?.id)]).filter(Boolean))]
+    const movers = [...new Set(visible.map(a => users[String(a.user?.id)]).filter(Boolean))]
     const edits = [...byProject.values()].reduce((n, list) => n + rollup(list, users).length, 0)
     body.push(`${edits} edit${edits === 1 ? '' : 's'} across ${byProject.size} project${byProject.size === 1 ? '' : 's'} by ${movers.join(', ') || 'unknown'}.`)
     body.push('')
@@ -154,51 +232,75 @@ export async function collectZoho ({ since, config }) {
     }
   }
 
-  // Comments on anything that moved, plus anything on your own plate.
-  const commentTargets = new Map()
-  for (const a of activities) {
+  // Everything below works off the tasks that actually moved in this window.
+  const taskTargets = new Map()
+  for (const a of visible) {
     if (a.activity !== 'task') continue
-    const projectName = names[String(a.project_id)] || `project ${a.project_id}`
-    if (excluded.includes(projectName)) continue
-    commentTargets.set(String(a.id), {
-      projectId: String(a.project_id), taskId: String(a.id), name: a.name, projectName
+    taskTargets.set(String(a.id), {
+      taskId: String(a.id),
+      projectId: String(a.project_id),
+      name: a.name,
+      projectName: names[String(a.project_id)] || `project ${a.project_id}`,
+      tagChanged: false
+    })
+  }
+  for (const a of visible) {
+    if (a.activity === 'task' && a.field?.field_name === 'tags') taskTargets.get(String(a.id)).tagChanged = true
+  }
+
+  const targets = [...taskTargets.values()]
+  const projectIds = [...new Set(targets.map(t => t.projectId))]
+  const projectTasks = await fetchProjectTasks(get, portalId, projectIds)
+  const tags = await fetchTags(get, portalId, targets.filter(t => t.tagChanged))
+
+  const current = new Map()
+  for (const t of targets) {
+    const fields = projectTasks.get(t.taskId)
+    if (!fields && !tags.has(t.taskId)) continue
+    current.set(t.taskId, {
+      name: t.name,
+      project: t.projectName,
+      status: fields?.status || '',
+      custom: fields?.custom || {},
+      ...(tags.has(t.taskId) ? { tags: tags.get(t.taskId) } : {})
     })
   }
 
-  // Tasks assigned to you, so the digest says what is on your plate, not just what moved.
-  const mine = (await get(token, `/restapi/portal/${portalId}/mytasks/`, {
-    index: '1', range: '100', status: 'open'
-  })).tasks || []
-  if (mine.length) {
-    const touched = mine.filter(t => t.last_updated_time_long && new Date(t.last_updated_time_long) >= since)
-    for (const t of touched) {
-      if (!t.project?.id_string || !t.id_string) continue
-      commentTargets.set(String(t.id_string), {
-        projectId: String(t.project.id_string), taskId: String(t.id_string),
-        name: t.name, projectName: t.project.name, isMine: true
-      })
+  const snapshot = readJson(fieldSnapshotPath)
+  const known = diffFields(current, snapshot, watch).filter(c => !c.isNew)
+  if (known.length) {
+    const byTask = new Map()
+    for (const c of known) {
+      if (!byTask.has(c.taskId)) byTask.set(c.taskId, { name: c.name, project: c.project, texts: [] })
+      byTask.get(c.taskId).texts.push(c.text)
     }
-    const overdue = mine.filter(t => t.end_date_long && new Date(t.end_date_long) < new Date())
-    body.push('### Your open tasks')
+    const rows = [...byTask.values()]
+    body.push('### Field changes')
     body.push('')
-    body.push(`${mine.length} open, ${touched.length} touched in this window.`)
-    for (const t of touched.slice(0, 15)) {
-      const status = t.status?.name || t.status || 'no status'
-      body.push(`- **${t.name}** (${t.project?.name || 'no project'}, ${status}, ${clock(t.last_updated_time_long)})`)
-    }
+    for (const r of rows.slice(0, 25)) body.push(`- **${r.name}** (${r.project}): ${r.texts.join('; ')}`)
+    if (rows.length > 25) body.push(`- plus ${rows.length - 25} more`)
     body.push('')
-    if (touched.length) {
-      attention.push(`${touched.length} Zoho task${touched.length === 1 ? '' : 's'} assigned to you changed: ${touched.slice(0, 5).map(t => t.name).join(', ')}`)
+    const releases = known.filter(c => /release/i.test(c.field))
+    if (releases.length) {
+      attention.push(`${releases.length} expected release date${releases.length === 1 ? '' : 's'} moved: ${[...new Set(releases.map(c => c.name))].slice(0, 4).join(', ')}`)
     }
-    if (overdue.length) {
-      attention.push(`${overdue.length} Zoho task${overdue.length === 1 ? '' : 's'} assigned to you ${overdue.length === 1 ? 'is' : 'are'} past the due date`)
-    }
+  } else if (!Object.keys(snapshot).length && current.size) {
+    body.push('### Field changes')
+    body.push('')
+    body.push(commit
+      ? `Baseline recorded for ${current.size} task${current.size === 1 ? '' : 's'}. Changes to ${watch.join(', ')} appear from the next digest onward.`
+      : `No baseline yet. The 07:00 run records one, then changes to ${watch.join(', ')} show up here.`)
+    body.push('')
   }
 
-  const targets = [...commentTargets.values()].slice(0, 60)
-  const comments = await fetchComments(token, portalId, targets, since)
+  if (commit && current.size) {
+    const merged = { ...snapshot }
+    for (const [taskId, value] of current) merged[taskId] = { ...merged[taskId], ...value }
+    writeFileSync(fieldSnapshotPath, JSON.stringify(merged))
+  }
+
+  const comments = await fetchComments(get, portalId, targets, since)
   if (comments.length) {
-    // Mentions carry the numeric user id, which beats matching on a name.
     const tagsMe = c => me && new RegExp(`zpuser#${me.id}#`).test(String(c.comment || ''))
     body.push('### Comments')
     body.push('')
@@ -209,11 +311,34 @@ export async function collectZoho ({ since, config }) {
     }
     if (comments.length > 20) body.push(`- plus ${comments.length - 20} more`)
     body.push('')
-
-    const flagged = comments.filter(c => tagsMe(c) || c.isMine)
+    const flagged = comments.filter(c => tagsMe(c))
     if (flagged.length) {
-      attention.push(`${flagged.length} Zoho comment${flagged.length === 1 ? '' : 's'} name you or land on your tasks: ${[...new Set(flagged.slice(0, 4).map(c => c.taskName))].join(', ')}`)
+      attention.push(`${flagged.length} Zoho comment${flagged.length === 1 ? '' : 's'} tag you: ${[...new Set(flagged.map(c => c.taskName))].slice(0, 4).join(', ')}`)
     }
+  }
+
+  const mine = (await get(`/restapi/portal/${portalId}/mytasks/`, {
+    index: '1', range: '100', status: 'open'
+  }, { soft: true }))?.tasks || []
+  if (mine.length) {
+    const touched = mine.filter(t => t.last_updated_time_long && new Date(t.last_updated_time_long) >= since)
+    body.push('### Your open tasks')
+    body.push('')
+    body.push(`${mine.length} open, ${touched.length} touched in this window.`)
+    for (const t of touched.slice(0, 15)) {
+      body.push(`- **${t.name}** (${t.project?.name || 'no project'}, ${t.status?.name || t.status || 'no status'}, ${clock(t.last_updated_time_long)})`)
+    }
+    body.push('')
+    if (touched.length) {
+      attention.push(`${touched.length} Zoho task${touched.length === 1 ? '' : 's'} assigned to you changed: ${touched.slice(0, 5).map(t => t.name).join(', ')}`)
+    }
+  }
+
+  if (warnings.length) {
+    body.push('### Gaps in this digest')
+    body.push('')
+    for (const w of warnings) body.push(`- ${w}`)
+    body.push('')
   }
 
   return { title: 'Zoho Projects', configured: true, body, attention }

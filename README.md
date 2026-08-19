@@ -58,6 +58,29 @@ Zoho project names are cached in `.tokens/zoho-projects.json` so a portal with
 hundreds of contracts costs one lookup, not hundreds.
 Secrets live in `.env` and cached OAuth tokens in `.tokens/`. Both are gitignored.
 
+## What each source reports
+
+- **GitHub**: commits per branch with author and churn, open PRs and issues touched.
+- **Trello**: card actions, comments, comments that tag you, cards you were added
+  to, your overdue and due soon cards.
+- **Zoho Projects**: portal wide activity rolled up per task, task comments with
+  mentions decoded, field changes on the fields in `zoho.watchFields`, and your
+  open tasks.
+- **Outlook**: inbox split into needs a reply, for information, and automated.
+
+Zoho never reports what a field changed to, only that it changed, so the bot
+snapshots the watched fields on each scheduled run and diffs the next one.
+Seed a baseline over a wider window without moving the digest window:
+
+```bash
+node src/index.js --since=14d --write-state --quiet
+```
+
+Zoho also throttles at 100 requests per endpoint per two minutes. Anything that
+can be read per project is read per project, tag and comment lookups are capped,
+and a throttled call adds a "Gaps in this digest" note rather than silently
+dropping data.
+
 ## Design notes
 
 Everything is read only. Nothing in this project sends mail, comments on a card,

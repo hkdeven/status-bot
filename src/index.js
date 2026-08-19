@@ -21,6 +21,10 @@ const sinceRaw = flag('since')
 const since = parseSince(sinceRaw, state.lastRun || new Date(Date.now() - 86400e3).toISOString())
 const generatedAt = new Date()
 
+// The field snapshot updates on any --write-state run, so it can be seeded over
+// a wide window, but only a run without --since advances the digest window.
+const commit = has('write-state')
+const advanceWindow = commit && !sinceRaw
 const only = flag('only')?.split(',').map(s => s.trim())
 const sources = [
   ['github', collectGithub],
@@ -32,7 +36,7 @@ const sources = [
 const sections = []
 for (const [name, collect] of sources) {
   try {
-    sections.push(await collect({ since, config, state }))
+    sections.push(await collect({ since, config, state, commit }))
   } catch (err) {
     sections.push({ title: name, configured: true, error: err.message })
   }
@@ -44,7 +48,7 @@ writeFileSync(file, markdown)
 writeFileSync(join(root, 'digests', 'latest.md'), markdown)
 
 // Only a scheduled run advances the window, so on demand runs never eat tomorrow's news.
-if (has('write-state') && !sinceRaw) {
+if (advanceWindow) {
   writeState({ ...state, lastRun: generatedAt.toISOString() })
 }
 
