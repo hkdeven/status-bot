@@ -70,6 +70,12 @@ Secrets live in `.env` and cached OAuth tokens in `.tokens/`. Both are gitignore
   so `21 AUGUST SPRINT` comes before `28 AUGUST SPRINT`, and anything without a
   sprint tag lands in one bucket at the end.
 - **Outlook**: inbox split into needs a reply, for information, and automated.
+  Notification mail from Trello, Zoho and GitHub is dropped as a duplicate when
+  that source already reported in the same digest, and counted in one line so
+  you can see it happened. Two exceptions keep it visible: the source failed or
+  is not connected, and GitHub mail about a repo missing from `config.json`,
+  which is the only place that repo could surface. Turn the whole behaviour off
+  with `outlook.suppressCoveredNotifications: false`.
 
 Zoho never reports what a field changed to, only that it changed, so the bot
 snapshots the watched fields on each scheduled run and diffs the next one.
@@ -83,6 +89,15 @@ Zoho also throttles at 100 requests per endpoint per two minutes. Anything that
 can be read per project is read per project, tag and comment lookups are capped,
 and a throttled call adds a "Gaps in this digest" note rather than silently
 dropping data.
+
+## Tests
+
+```bash
+npm test
+```
+
+Covers the duplicate suppression rules, which cannot be exercised against a live
+mailbox without signing in.
 
 ## Design notes
 

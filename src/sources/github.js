@@ -143,5 +143,5 @@ export async function collectGithub ({ since, config }) {
     }
   }
 
-  return { title: 'GitHub', configured: true, body, attention }
+  return { title: 'GitHub', configured: true, body, attention, repos }
 }

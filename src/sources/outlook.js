@@ -14,6 +14,39 @@ async function get (token, path, params = {}) {
 const addr = r => (r?.emailAddress?.address || '').toLowerCase()
 const AUTOMATED = /(no-?reply|do-?not-?reply|notification|newsletter|mailer|bounce|postmaster|marketing|alerts?@)/i
 
+// Notification mail from a platform the digest already read is an echo, not news.
+const PLATFORM_SENDERS = {
+  trello: /@(.*\.)?trello\.com$/i,
+  zoho: /@(.*\.)?zoho(projects|corp)?\.(com|eu|in|com\.au)$/i,
+  github: /@(.*\.)?github\.com$/i
+}
+
+// GitHub subjects carry the repo, as in "[owner/repo] Something happened (#12)".
+const repoFromSubject = subject => /\[([\w.-]+\/[\w.-]+)\]/.exec(subject || '')?.[1]
+
+export function platformOf (message) {
+  const from = addr(message.from)
+  for (const [platform, pattern] of Object.entries(PLATFORM_SENDERS)) {
+    if (pattern.test(from)) return platform
+  }
+  return null
+}
+
+// Returns 'echo' to drop it, 'uncovered' to show it, or null when it is not
+// platform mail at all. GitHub mail about an untracked repo is never an echo,
+// since nothing else in the digest reports that repo.
+export function echoVerdict (message, coverage = {}) {
+  const platform = platformOf(message)
+  if (!platform) return null
+  if (!coverage[platform]?.covered) return 'uncovered'
+  if (platform === 'github') {
+    const repo = repoFromSubject(message.subject)
+    const tracked = (coverage.github.repos || []).map(r => r.toLowerCase())
+    if (!repo || !tracked.includes(repo.toLowerCase())) return 'uncovered'
+  }
+  return 'echo'
+}
+
 function classify (m, mine) {
   const from = addr(m.from)
   const to = (m.toRecipients || []).map(addr)
@@ -37,7 +70,7 @@ function line (m) {
   return `- **${m.subject || '(no subject)'}**, ${who} (${clock(m.receivedDateTime)})${m.isRead ? '' : ' [unread]'}\n  ${preview}`
 }
 
-export async function collectOutlook ({ since, config }) {
+export async function collectOutlook ({ since, config, coverage = {} }) {
   if (!process.env.MS_CLIENT_ID) {
     return { title: 'Email (Outlook)', configured: false, setupHint: 'Add MS_CLIENT_ID and MS_TENANT_ID to .env.' }
   }
@@ -63,13 +96,19 @@ export async function collectOutlook ({ since, config }) {
   })
   const messages = res.value || []
 
-  const buckets = { needsYou: [], fyi: [], noise: [] }
-  for (const m of messages) buckets[classify(m, mine)].push(m)
+  const buckets = { needsYou: [], fyi: [], noise: [], echo: [], uncovered: [] }
+  const suppress = config.outlook?.suppressCoveredNotifications !== false
+  for (const m of messages) {
+    const verdict = suppress ? echoVerdict(m, coverage) : null
+    if (verdict === 'echo') { buckets.echo.push(m); continue }
+    if (verdict === 'uncovered') { buckets.uncovered.push(m); continue }
+    buckets[classify(m, mine)].push(m)
+  }
 
   const body = []
   const attention = []
 
-  body.push(`${messages.length} message${messages.length === 1 ? '' : 's'} in the inbox for this window: ${buckets.needsYou.length} need you, ${buckets.fyi.length} for information, ${buckets.noise.length} automated.`)
+  body.push(`${messages.length} message${messages.length === 1 ? '' : 's'} in the inbox for this window: ${buckets.needsYou.length} need you, ${buckets.fyi.length} for information, ${buckets.noise.length} automated, ${buckets.echo.length} already reported above.`)
   body.push('')
 
   if (buckets.needsYou.length) {
@@ -85,6 +124,32 @@ export async function collectOutlook ({ since, config }) {
       body.push(`- ${m.subject || '(no subject)'}, ${m.from?.emailAddress?.name || addr(m.from)} (${clock(m.receivedDateTime)})`)
     }
     if (buckets.fyi.length > 20) body.push(`- plus ${buckets.fyi.length - 20} more`)
+    body.push('')
+  }
+
+  if (buckets.uncovered.length) {
+    body.push('**Platform mail not covered elsewhere**')
+    for (const m of buckets.uncovered.slice(0, 15)) {
+      const why = platformOf(m) === 'github' ? 'repo is not in config.json' : 'that source did not report'
+      body.push(`- ${m.subject || '(no subject)'}, ${m.from?.emailAddress?.name || addr(m.from)} (${clock(m.receivedDateTime)}), ${why}`)
+    }
+    if (buckets.uncovered.length > 15) body.push(`- plus ${buckets.uncovered.length - 15} more`)
+    body.push('')
+    const repos = [...new Set(buckets.uncovered.filter(m => platformOf(m) === 'github')
+      .map(m => repoFromSubject(m.subject)).filter(Boolean))]
+    if (repos.length) {
+      attention.push(`GitHub mail about ${repos.length} repo${repos.length === 1 ? '' : 's'} the digest does not track: ${repos.join(', ')}`)
+    }
+  }
+
+  if (buckets.echo.length) {
+    const byPlatform = new Map()
+    for (const m of buckets.echo) {
+      const p = platformOf(m)
+      byPlatform.set(p, (byPlatform.get(p) || 0) + 1)
+    }
+    const parts = [...byPlatform.entries()].map(([p, n]) => `${p} ${n}`).join(', ')
+    body.push(`**Suppressed as duplicates**: ${buckets.echo.length} notification email${buckets.echo.length === 1 ? '' : 's'} (${parts}). Those changes are in the sections above.`)
     body.push('')
   }
 

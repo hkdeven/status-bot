@@ -26,18 +26,24 @@ const generatedAt = new Date()
 const commit = has('write-state')
 const advanceWindow = commit && !sinceRaw
 const only = flag('only')?.split(',').map(s => s.trim())
+// Outlook runs last on purpose: it needs to know which platforms already
+// reported, so their notification mail can be dropped as an echo.
 const sources = [
   ['github', collectGithub],
-  ['outlook', collectOutlook],
   ['trello', collectTrello],
-  ['zoho', collectZoho]
+  ['zoho', collectZoho],
+  ['outlook', collectOutlook]
 ].filter(([name]) => !only || only.includes(name))
 
 const sections = []
+const coverage = {}
 for (const [name, collect] of sources) {
   try {
-    sections.push(await collect({ since, config, state, commit }))
+    const section = await collect({ since, config, state, commit, coverage })
+    coverage[name] = { covered: !!section.configured && !section.error, repos: section.repos }
+    sections.push(section)
   } catch (err) {
+    coverage[name] = { covered: false }
     sections.push({ title: name, configured: true, error: err.message })
   }
 }

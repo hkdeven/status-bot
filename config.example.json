@@ -9,7 +9,8 @@
     "yourAddresses": [
       "you@example.com"
     ],
-    "maxMessages": 100
+    "maxMessages": 100,
+    "suppressCoveredNotifications": true
   },
   "trello": {
     "boards": "all",
