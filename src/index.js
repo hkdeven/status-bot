@@ -2,7 +2,8 @@
 import { writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { root, readState, writeState, loadConfig, parseSince } from './state.js'
-import { render, stamp } from './render.js'
+import { render, stamp, fileStamp } from './render.js'
+import { writeIndex } from './archive.js'
 import { toHtml } from './html.js'
 import { collectGithub } from './sources/github.js'
 import { collectOutlook } from './sources/outlook.js'
@@ -50,15 +51,18 @@ for (const [name, collect] of sources) {
 }
 
 const markdown = render({ since, generatedAt, sections })
-const file = join(root, 'digests', `${stamp(generatedAt)}.md`)
+// Timestamped, so several runs on one day never overwrite each other.
+const name = fileStamp(generatedAt)
+const file = join(root, 'digests', `${name}.md`)
 writeFileSync(file, markdown)
 writeFileSync(join(root, 'digests', 'latest.md'), markdown)
 
 // macOS has no Markdown renderer, so the same digest is written as a styled
 // page that opens formatted in any browser.
 const html = toHtml(markdown, `Status digest, ${stamp(generatedAt)}`)
-writeFileSync(join(root, 'digests', `${stamp(generatedAt)}.html`), html)
+writeFileSync(join(root, 'digests', `${name}.html`), html)
 writeFileSync(join(root, 'digests', 'latest.html'), html)
+const kept = writeIndex()
 
 // Only a scheduled run advances the window, so on demand runs never eat tomorrow's news.
 if (advanceWindow) {
@@ -69,5 +73,5 @@ if (has('quiet')) {
   console.log(file)
 } else {
   console.log(markdown)
-  console.log(`\nSaved to ${file}`)
+  console.log(`\nSaved to ${file}, ${kept} digest${kept === 1 ? '' : 's'} in the archive`)
 }

@@ -12,8 +12,11 @@ node src/index.js --only=github
 node src/index.js --quiet      # print only the file path
 ```
 
-Output goes to `digests/YYYY-MM-DD.md` and `digests/latest.md`, plus a styled
-`.html` copy of each. macOS has no Markdown renderer, so the HTML is what you
+Every run is kept. Output goes to `digests/YYYY-MM-DD-HHMMSS.md` and a styled
+`.html` copy, so several runs on one day never overwrite each other, and
+`digests/latest.*` always points at the newest. `digests/index.html` is a
+browsable archive of every past digest, newest first, with how many items needed
+you in each. macOS has no Markdown renderer, so the HTML is what you
 actually read: it opens formatted in any browser, needs nothing installed, and
 follows the system light or dark setting.
 
@@ -42,7 +45,7 @@ Three ways, no terminal needed:
   `node src/index.js --quiet` and summarizes the result in chat.
 - Put a `.command` launcher on the Desktop that runs the bot and opens the file.
 - Symlink `digests/latest.html` to the Desktop to read the last digest without
-  refreshing it.
+  refreshing it, and `digests/index.html` for the archive.
 
 ## Sources
 
