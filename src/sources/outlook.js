@@ -21,6 +21,11 @@ const PLATFORM_SENDERS = {
   github: /@(.*\.)?github\.com$/i
 }
 
+// Help desk mail is addressed to him and unread, so it looks urgent to every
+// heuristic, but a queue of submitted tickets is a list to skim, not an inbox
+// of people waiting on a reply.
+const DEFAULT_HELPDESK = ['zohodesk\\.com', 'helpdesk@', 'servicedesk@']
+
 // GitHub subjects carry the repo, as in "[owner/repo] Something happened (#12)".
 const repoFromSubject = subject => /\[([\w.-]+\/[\w.-]+)\]/.exec(subject || '')?.[1]
 
@@ -52,13 +57,13 @@ function classify (m, mine) {
   const to = (m.toRecipients || []).map(addr)
   const cc = (m.ccRecipients || []).map(addr)
   const direct = to.some(a => mine.includes(a))
-  const mentioned = m.mentionsPreview?.isMentioned
+  // mentionsPreview is not selectable on this endpoint, so a direct address is
+  // the strongest signal the message is aimed at him.
 
   if (AUTOMATED.test(from) || AUTOMATED.test(m.from?.emailAddress?.name || '')) return 'noise'
   if (m.flag?.flagStatus === 'flagged') return 'needsYou'
-  if (m.importance === 'high' && (direct || mentioned)) return 'needsYou'
+  if (m.importance === 'high' && direct) return 'needsYou'
   if (direct && !m.isRead) return 'needsYou'
-  if (mentioned) return 'needsYou'
   if (direct) return 'fyi'
   if (cc.some(a => mine.includes(a))) return 'fyi'
   return 'noise'
@@ -69,6 +74,9 @@ function line (m) {
   const preview = (m.bodyPreview || '').replace(/\s+/g, ' ').trim().slice(0, 160)
   return `- **${m.subject || '(no subject)'}**, ${who} (${clock(m.receivedDateTime)})${m.isRead ? '' : ' [unread]'}\n  ${preview}`
 }
+
+const ticketNumber = preview => /#(\d{3,})/.exec(preview || '')?.[1]
+const submitter = subject => /^(.*?)\s+has submitted a new ticket/i.exec(subject || '')?.[1]
 
 export async function collectOutlook ({ since, config, coverage = {} }) {
   if (!process.env.MS_CLIENT_ID) {
@@ -90,25 +98,27 @@ export async function collectOutlook ({ since, config, coverage = {} }) {
 
   const res = await get(token, '/me/mailFolders/inbox/messages', {
     $filter: `receivedDateTime ge ${since.toISOString()}`,
-    $select: 'subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,importance,flag,bodyPreview,webLink,mentionsPreview,conversationId',
+    $select: 'subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,importance,flag,bodyPreview,webLink,conversationId',
     $top: String(config.outlook?.maxMessages || 100),
     $orderby: 'receivedDateTime desc'
   })
   const messages = res.value || []
 
-  const buckets = { needsYou: [], fyi: [], noise: [], echo: [], uncovered: [] }
+  const buckets = { needsYou: [], fyi: [], noise: [], echo: [], uncovered: [], helpdesk: [] }
   const suppress = config.outlook?.suppressCoveredNotifications !== false
+  const helpdesk = new RegExp((config.outlook?.helpdeskSenders || DEFAULT_HELPDESK).join('|'), 'i')
   for (const m of messages) {
     const verdict = suppress ? echoVerdict(m, coverage) : null
     if (verdict === 'echo') { buckets.echo.push(m); continue }
     if (verdict === 'uncovered') { buckets.uncovered.push(m); continue }
+    if (helpdesk.test(addr(m.from))) { buckets.helpdesk.push(m); continue }
     buckets[classify(m, mine)].push(m)
   }
 
   const body = []
   const attention = []
 
-  body.push(`${messages.length} message${messages.length === 1 ? '' : 's'} in the inbox for this window: ${buckets.needsYou.length} need you, ${buckets.fyi.length} for information, ${buckets.noise.length} automated, ${buckets.echo.length} already reported above.`)
+  body.push(`${messages.length} message${messages.length === 1 ? '' : 's'} in the inbox for this window: ${buckets.needsYou.length} need you, ${buckets.fyi.length} for information, ${buckets.helpdesk.length} help desk, ${buckets.noise.length} automated, ${buckets.echo.length} already reported above.`)
   body.push('')
 
   if (buckets.needsYou.length) {
@@ -124,6 +134,21 @@ export async function collectOutlook ({ since, config, coverage = {} }) {
       body.push(`- ${m.subject || '(no subject)'}, ${m.from?.emailAddress?.name || addr(m.from)} (${clock(m.receivedDateTime)})`)
     }
     if (buckets.fyi.length > 20) body.push(`- plus ${buckets.fyi.length - 20} more`)
+    body.push('')
+  }
+
+  if (buckets.helpdesk.length) {
+    body.push(`**Help desk queue**: ${buckets.helpdesk.length} new ticket${buckets.helpdesk.length === 1 ? '' : 's'}`)
+    for (const m of buckets.helpdesk.slice(0, 12)) {
+      const num = ticketNumber(m.bodyPreview)
+      const who = submitter(m.subject)
+      const label = who ? `${who}` : (m.subject || '(no subject)')
+      const gist = (m.bodyPreview || '').replace(/\s+/g, ' ')
+        .replace(/^.*?has been submitted by .*?\.\s*/i, '')
+        .replace(/^#\d+\s*/, '').slice(0, 90)
+      body.push(`- ${num ? `#${num} ` : ''}${label}: ${gist}`)
+    }
+    if (buckets.helpdesk.length > 12) body.push(`- plus ${buckets.helpdesk.length - 12} more`)
     body.push('')
   }
 

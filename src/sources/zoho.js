@@ -12,7 +12,7 @@ const fieldSnapshotPath = join(root, '.tokens', 'zoho-task-fields.json')
 
 // Zoho allows 100 requests per endpoint per two minutes, so anything per task is
 // rationed and anything that can be fetched per project is fetched per project.
-const CAPS = { tagLookups: 60, commentLookups: 30, projectPages: 3 }
+const CAPS = { tagLookups: 60, commentLookups: 30, projectPages: 8 }
 
 function makeClient (token, warnings) {
   return async function get (path, params = {}, { soft = false } = {}) {
@@ -67,8 +67,16 @@ function stripHtml (html) {
     .trim()
 }
 
+// Task keys read like "AP1-T1505" and everyone refers to the last four digits.
+function ticketOf (key) {
+  const digits = /(\d+)\s*$/.exec(String(key || ''))?.[1]
+  return digits ? digits.slice(-4) : null
+}
+
+const lead = ticket => (ticket ? `${ticket} · ` : '')
+
 // Zoho date custom fields come back as "08-21-2026 12:00:00 AM".
-const tidy = v => String(v).replace(/\s+12:00:00\s*AM$/i, '')
+const tidy = v => String(v).replace(/\s+12:00:00\s*AM$/i, '').trim()
 
 // One activity row per changed field, so a single edit can appear eight times.
 function rollup (activities, users) {
@@ -106,7 +114,8 @@ async function fetchProjectTasks (get, portalId, projectIds) {
         const custom = {}
         for (const f of t.custom_fields || []) custom[f.label_name] = f.value
         byTask.set(String(t.id_string || t.id), {
-          name: t.name, projectId: String(projectId), status: t.status?.name || '', custom
+          name: t.name, projectId: String(projectId), status: t.status?.name || '',
+          key: t.key || '', custom
         })
       }
       if (tasks.length < 100) break
@@ -117,18 +126,23 @@ async function fetchProjectTasks (get, portalId, projectIds) {
 
 // Tags are not on any list endpoint and the tags API needs a scope we do not
 // hold, so they are read one task at a time, in batches, up to the cap.
-async function fetchTags (get, portalId, targets, warnings) {
+async function fetchDetails (get, portalId, targets, warnings) {
   const out = new Map()
   const list = targets.slice(0, CAPS.tagLookups)
   if (targets.length > list.length) {
-    warnings.push(`Tags read for ${list.length} of ${targets.length} tasks, the rest are grouped as untagged to stay inside the Zoho rate limit`)
+    warnings.push(`Tags and ticket numbers read for ${list.length} of ${targets.length} tasks, the rest are grouped as untagged to stay inside the Zoho rate limit`)
   }
   const batch = 5
   for (let i = 0; i < list.length; i += batch) {
     await Promise.all(list.slice(i, i + batch).map(async t => {
       const res = await get(`/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}`, {}, { soft: true })
       const task = Array.isArray(res) ? res[0] : (res?.tasks?.[0] || res)
-      if (task?.tags) out.set(t.taskId, task.tags.map(x => x.name).sort())
+      if (!task) return
+      out.set(t.taskId, {
+        tags: task.tags ? task.tags.map(x => x.name).sort() : undefined,
+        // v1 calls it key, v3 calls the same string prefix.
+        key: task.key || task.prefix || ''
+      })
     }))
   }
   return out
@@ -156,7 +170,7 @@ async function fetchComments (get, portalId, targets, since) {
       const res = await get(`/api/v3/portal/${portalId}/projects/${t.projectId}/tasks/${t.taskId}/comments`, {}, { soft: true })
       return (res?.comments || [])
         .filter(c => new Date(c.created_time) >= since)
-        .map(c => ({ ...c, taskName: t.name, projectName: t.projectName, isMine: !!t.isMine }))
+        .map(c => ({ ...c, taskId: t.taskId, taskName: t.name, projectName: t.projectName, isMine: !!t.isMine }))
     }))
     out.push(...results.flat())
   }
@@ -250,14 +264,17 @@ export async function collectZoho ({ since, config, commit }) {
   const targets = [...taskTargets.values()]
   const projectIds = [...new Set(targets.map(t => t.projectId))]
   const projectTasks = await fetchProjectTasks(get, portalId, projectIds)
-  const tags = await fetchTags(get, portalId, targets, warnings)
+  const details = await fetchDetails(get, portalId, targets, warnings)
+  const tagsOf = taskId => details.get(String(taskId))?.tags
 
   // Activity is grouped by sprint tag, since that is how the work is planned.
   // Everything without one lands in a single bucket at the end.
+  // The project task list only pages so deep, so the per-task lookup fills the gaps.
+  const ticketFor = id => ticketOf(projectTasks.get(String(id))?.key || details.get(String(id))?.key)
   const sprintPattern = new RegExp(config.zoho?.sprintTagPattern || 'SPRINT', 'i')
   const UNTAGGED = 'No sprint tag'
-  const sprintOf = taskId => (tags.get(taskId) || []).find(t => sprintPattern.test(t)) || UNTAGGED
-  const otherTags = taskId => (tags.get(taskId) || []).filter(t => !sprintPattern.test(t))
+  const sprintOf = taskId => (tagsOf(taskId) || []).find(t => sprintPattern.test(t)) || UNTAGGED
+  const otherTags = taskId => (tagsOf(taskId) || []).filter(t => !sprintPattern.test(t))
 
   if (visible.length) {
     const bySprint = new Map()
@@ -289,7 +306,8 @@ export async function collectZoho ({ since, config, commit }) {
         const project = target?.projectName || names[String(g.a.project_id)] || 'unknown project'
         const extra = otherTags(String(g.a.id))
         const extraText = extra.length ? `, tagged ${extra.join(', ')}` : ''
-        body.push(`- ${describe(g)} [${project}${extraText}] (${clock(g.latest)})`)
+        const ticket = g.a.activity === 'task' ? ticketFor(g.a.id) : null
+        body.push(`- ${lead(ticket)}${describe(g)} [${project}${extraText}] (${clock(g.latest)})`)
       }
       if (rolled.length > 15) body.push(`- plus ${rolled.length - 15} more`)
       body.push('')
@@ -299,13 +317,14 @@ export async function collectZoho ({ since, config, commit }) {
   const current = new Map()
   for (const t of targets) {
     const fields = projectTasks.get(t.taskId)
-    if (!fields && !tags.has(t.taskId)) continue
+    const taskTags = tagsOf(t.taskId)
+    if (!fields && !taskTags) continue
     current.set(t.taskId, {
       name: t.name,
       project: t.projectName,
       status: fields?.status || '',
       custom: fields?.custom || {},
-      ...(tags.has(t.taskId) ? { tags: tags.get(t.taskId) } : {})
+      ...(taskTags ? { tags: taskTags } : {})
     })
   }
 
@@ -314,13 +333,13 @@ export async function collectZoho ({ since, config, commit }) {
   if (known.length) {
     const byTask = new Map()
     for (const c of known) {
-      if (!byTask.has(c.taskId)) byTask.set(c.taskId, { name: c.name, project: c.project, texts: [] })
+      if (!byTask.has(c.taskId)) byTask.set(c.taskId, { taskId: c.taskId, name: c.name, project: c.project, texts: [] })
       byTask.get(c.taskId).texts.push(c.text)
     }
     const rows = [...byTask.values()]
     body.push('### Field changes')
     body.push('')
-    for (const r of rows.slice(0, 25)) body.push(`- **${r.name}** (${r.project}): ${r.texts.join('; ')}`)
+    for (const r of rows.slice(0, 25)) body.push(`- ${lead(ticketFor(r.taskId))}**${r.name}** (${r.project}): ${r.texts.join('; ')}`)
     if (rows.length > 25) body.push(`- plus ${rows.length - 25} more`)
     body.push('')
     const releases = known.filter(c => /release/i.test(c.field))
@@ -345,18 +364,35 @@ export async function collectZoho ({ since, config, commit }) {
   const comments = await fetchComments(get, portalId, targets, since)
   if (comments.length) {
     const tagsMe = c => me && new RegExp(`zpuser#${me.id}#`).test(String(c.comment || ''))
-    body.push('### Comments')
-    body.push('')
-    for (const c of comments.slice(0, 20)) {
+    const fromMe = c => me && String(c.created_by?.id) === String(me.id)
+    // Someone else tagging you, or asking a question, is work. The rest is news.
+    const needsReply = c => !fromMe(c) && (tagsMe(c) || /\?/.test(stripHtml(c.comment)))
+
+    const render = c => {
       const text = stripHtml(c.comment)
       const mark = tagsMe(c) ? ' [tags you]' : ''
-      body.push(`- **${c.taskName}** (${c.projectName}), ${c.created_by?.full_name || 'someone'} (${clock(c.created_time)})${mark}: "${text.length > 220 ? text.slice(0, 220) + '...' : text}"`)
+      return `- ${lead(ticketFor(c.taskId))}**${c.taskName}** (${c.projectName}), ${c.created_by?.full_name || 'someone'} (${clock(c.created_time)})${mark}: "${text.length > 220 ? text.slice(0, 220) + '...' : text}"`
     }
-    if (comments.length > 20) body.push(`- plus ${comments.length - 20} more`)
-    body.push('')
-    const flagged = comments.filter(c => tagsMe(c))
-    if (flagged.length) {
-      attention.push(`${flagged.length} Zoho comment${flagged.length === 1 ? '' : 's'} tag you: ${[...new Set(flagged.map(c => c.taskName))].slice(0, 4).join(', ')}`)
+
+    const followUp = comments.filter(needsReply)
+    const fyi = comments.filter(c => !needsReply(c))
+
+    if (followUp.length) {
+      body.push('### Comments that require follow up')
+      body.push('')
+      for (const c of followUp.slice(0, 20)) body.push(render(c))
+      if (followUp.length > 20) body.push(`- plus ${followUp.length - 20} more`)
+      body.push('')
+      const tickets = [...new Set(followUp.map(c => ticketFor(c.taskId) || c.taskName))].slice(0, 6)
+      attention.push(`${followUp.length} Zoho comment${followUp.length === 1 ? '' : 's'} need an answer from you: ${tickets.join(', ')}`)
+    }
+
+    if (fyi.length) {
+      body.push('### Comments, just FYI')
+      body.push('')
+      for (const c of fyi.slice(0, 15)) body.push(render(c))
+      if (fyi.length > 15) body.push(`- plus ${fyi.length - 15} more`)
+      body.push('')
     }
   }
 
@@ -364,16 +400,30 @@ export async function collectZoho ({ since, config, commit }) {
     index: '1', range: '100', status: 'open'
   }, { soft: true }))?.tasks || []
   if (mine.length) {
+    const statusOf = t => t.status?.name || t.status || 'no status'
+    const releasePattern = new RegExp(config.zoho?.awaitingDeploymentStatus || 'ready for release', 'i')
     const touched = mine.filter(t => t.last_updated_time_long && new Date(t.last_updated_time_long) >= since)
-    body.push('### Your open tasks')
-    body.push('')
-    body.push(`${mine.length} open, ${touched.length} touched in this window.`)
-    for (const t of touched.slice(0, 15)) {
-      body.push(`- **${t.name}** (${t.project?.name || 'no project'}, ${t.status?.name || t.status || 'no status'}, ${clock(t.last_updated_time_long)})`)
+    const awaiting = touched.filter(t => releasePattern.test(statusOf(t)))
+    const yours = touched.filter(t => !releasePattern.test(statusOf(t)))
+    const row = t => `- ${lead(ticketOf(t.key))}**${t.name}** (${t.project?.name || 'no project'}, ${statusOf(t)}, ${clock(t.last_updated_time_long)})`
+
+    if (yours.length) {
+      body.push('### Your open tasks')
+      body.push('')
+      for (const t of yours.slice(0, 15)) body.push(row(t))
+      if (yours.length > 15) body.push(`- plus ${yours.length - 15} more`)
+      body.push('')
+      attention.push(`${yours.length} Zoho task${yours.length === 1 ? '' : 's'} assigned to you changed: ${yours.slice(0, 5).map(t => ticketOf(t.key) || t.name).join(', ')}`)
     }
-    body.push('')
-    if (touched.length) {
-      attention.push(`${touched.length} Zoho task${touched.length === 1 ? '' : 's'} assigned to you changed: ${touched.slice(0, 5).map(t => t.name).join(', ')}`)
+
+    // Ready for release sits with the developers until they push, so it is
+    // tracked but never counted as something waiting on him.
+    if (awaiting.length) {
+      body.push('### Awaiting deployment')
+      body.push('')
+      for (const t of awaiting.slice(0, 20)) body.push(row(t))
+      if (awaiting.length > 20) body.push(`- plus ${awaiting.length - 20} more`)
+      body.push('')
     }
   }
 

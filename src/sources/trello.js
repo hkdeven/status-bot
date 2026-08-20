@@ -77,6 +77,8 @@ export async function collectTrello ({ since, config }) {
   const wanted = config.trello?.boards
   let boards = await get('/members/me/boards', { filter: 'open', fields: 'name,shortUrl,dateLastActivity' })
   if (Array.isArray(wanted)) boards = boards.filter(b => wanted.includes(b.name) || wanted.includes(b.id))
+  const excluded = config.trello?.excludeBoards || []
+  boards = boards.filter(b => !excluded.includes(b.name) && !excluded.includes(b.id))
 
   const sinceISO = since.toISOString()
   const dueWindow = Date.now() + (config.trello?.dueSoonDays ?? 3) * 86400e3
@@ -93,11 +95,12 @@ export async function collectTrello ({ since, config }) {
       filter: 'open',
       fields: 'name,due,dueComplete,idMembers,shortUrl'
     })
+    // Overdue is deliberately not reported: the board carries year old due dates
+    // that drown everything else. Only cards coming up are worth a line.
     const mine = cards.filter(c => c.idMembers?.includes(me.id))
-    const overdue = mine.filter(c => c.due && !c.dueComplete && new Date(c.due) < new Date())
     const dueSoon = mine.filter(c => c.due && !c.dueComplete && new Date(c.due) >= new Date() && new Date(c.due) <= dueWindow)
 
-    if (!actions.length && !overdue.length && !dueSoon.length) continue
+    if (!actions.length && !dueSoon.length) continue
 
     body.push(`### ${board.name}`)
     body.push('')
@@ -137,18 +140,6 @@ export async function collectTrello ({ since, config }) {
       attention.push(`You were put on ${addedToMe.length} card${addedToMe.length === 1 ? '' : 's'} on ${board.name}: ${addedToMe.map(a => a.data?.card?.name).join(', ')}`)
     }
 
-    if (overdue.length) {
-      const staleCutoff = Date.now() - 14 * 86400e3
-      const recent = overdue.filter(c => new Date(c.due).getTime() >= staleCutoff)
-      const stale = overdue.length - recent.length
-      body.push('**Your overdue cards**')
-      for (const c of recent) body.push(`- [${c.name}](${c.shortUrl}), due ${clock(c.due)}, ${ago(c.due)}`)
-      if (stale) body.push(`- plus ${stale} overdue by more than two weeks, probably dead due dates worth clearing`)
-      body.push('')
-      if (recent.length) {
-        attention.push(`${recent.length} of your cards on ${board.name} went overdue recently: ${recent.map(c => c.name).join(', ')}`)
-      }
-    }
     if (dueSoon.length) {
       body.push('**Your cards due soon**')
       for (const c of dueSoon) body.push(`- [${c.name}](${c.shortUrl}), due ${clock(c.due)}`)

@@ -61,6 +61,7 @@ export async function collectGithub ({ since, config }) {
   const sinceISO = since.toISOString()
   const body = []
   const attention = []
+  const quiet = []
 
   for (const full of repos) {
     const [owner, name] = full.split('/')
@@ -90,15 +91,14 @@ export async function collectGithub ({ since, config }) {
     const prs = repo.pullRequests.nodes.filter(p => new Date(p.updatedAt) >= since)
     const issues = repo.issues.nodes.filter(i => new Date(i.updatedAt) >= since)
 
-    body.push(`### ${full}`)
-    body.push('')
-
+    // A repo with nothing new is not worth a heading.
     if (!commits.length && !prs.length && !issues.length) {
-      const quiet = repo.pushedAt ? `quiet, last push ${ago(repo.pushedAt)}` : 'quiet'
-      body.push(`No activity in this window (${quiet}).`)
-      body.push('')
+      quiet.push(full)
       continue
     }
+
+    body.push(`### ${full}`)
+    body.push('')
 
     if (commits.length) {
       const byBranch = new Map()
@@ -141,6 +141,11 @@ export async function collectGithub ({ since, config }) {
     if (newBranches.length >= 3) {
       attention.push(`${full} saw work on ${newBranches.length} non-default branches: ${newBranches.slice(0, 5).join(', ')}`)
     }
+  }
+
+  if (quiet.length) {
+    body.push(`Nothing new in ${quiet.length} other repo${quiet.length === 1 ? '' : 's'}: ${quiet.join(', ')}.`)
+    body.push('')
   }
 
   return { title: 'GitHub', configured: true, body, attention, repos }

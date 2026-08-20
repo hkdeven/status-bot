@@ -49,7 +49,7 @@ Three ways, no terminal needed:
 | Source | Status | Auth |
 | --- | --- | --- |
 | GitHub | ready | reuses the `gh` CLI token already on your machine |
-| Outlook | needs setup | Entra app registration, delegated Mail.Read, device code sign in |
+| Outlook | ready | Entra app registration, delegated Mail.Read, device code sign in |
 | Trello | needs setup | read only API key plus token in `.env` |
 | Zoho Projects | needs setup | self client refresh token in `.env`, read scopes only |
 
@@ -72,7 +72,10 @@ Secrets live in `.env` and cached OAuth tokens in `.tokens/`. Both are gitignore
   sprint, default `SPRINT`. Sprint headings sort by the date in the tag name,
   so `21 AUGUST SPRINT` comes before `28 AUGUST SPRINT`, and anything without a
   sprint tag lands in one bucket at the end.
-- **Outlook**: inbox split into needs a reply, for information, and automated.
+- **Outlook**: inbox split into needs a reply, for information, help desk queue,
+  and automated. Help desk mail is addressed to you and unread, so every urgency
+  heuristic promotes it, but a ticket queue is a list to skim rather than people
+  waiting on you. `outlook.helpdeskSenders` decides what counts.
   Notification mail from Trello, Zoho and GitHub is dropped as a duplicate when
   that source already reported in the same digest, and counted in one line so
   you can see it happened. Two exceptions keep it visible: the source failed or

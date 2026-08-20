@@ -10,11 +10,19 @@
       "you@example.com"
     ],
     "maxMessages": 100,
-    "suppressCoveredNotifications": true
+    "suppressCoveredNotifications": true,
+    "helpdeskSenders": [
+      "zohodesk\\.com",
+      "helpdesk@",
+      "servicedesk@"
+    ]
   },
   "trello": {
     "boards": "all",
-    "dueSoonDays": 3
+    "dueSoonDays": 3,
+    "excludeBoards": [
+      "A Board You Never Read"
+    ]
   },
   "zoho": {
     "projects": "all",
@@ -26,6 +34,7 @@
       "tags",
       "status"
     ],
-    "sprintTagPattern": "SPRINT"
+    "sprintTagPattern": "SPRINT",
+    "awaitingDeploymentStatus": "ready for release"
   }
 }
