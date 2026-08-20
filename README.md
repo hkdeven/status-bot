@@ -12,7 +12,10 @@ node src/index.js --only=github
 node src/index.js --quiet      # print only the file path
 ```
 
-Output goes to `digests/YYYY-MM-DD.md` and `digests/latest.md`.
+Output goes to `digests/YYYY-MM-DD.md` and `digests/latest.md`, plus a styled
+`.html` copy of each. macOS has no Markdown renderer, so the HTML is what you
+actually read: it opens formatted in any browser, needs nothing installed, and
+follows the system light or dark setting.
 
 Only `--digest` style runs (`--write-state`, no `--since`) advance the window,
 so an on demand run never swallows the next morning's news.
@@ -38,7 +41,7 @@ Three ways, no terminal needed:
 - Ask Claude Code for the digest, or add a `/status` skill that shells out to
   `node src/index.js --quiet` and summarizes the result in chat.
 - Put a `.command` launcher on the Desktop that runs the bot and opens the file.
-- Symlink `digests/latest.md` to the Desktop to read the last digest without
+- Symlink `digests/latest.html` to the Desktop to read the last digest without
   refreshing it.
 
 ## Sources

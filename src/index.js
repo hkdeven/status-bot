@@ -3,6 +3,7 @@ import { writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { root, readState, writeState, loadConfig, parseSince } from './state.js'
 import { render, stamp } from './render.js'
+import { toHtml } from './html.js'
 import { collectGithub } from './sources/github.js'
 import { collectOutlook } from './sources/outlook.js'
 import { collectTrello } from './sources/trello.js'
@@ -52,6 +53,12 @@ const markdown = render({ since, generatedAt, sections })
 const file = join(root, 'digests', `${stamp(generatedAt)}.md`)
 writeFileSync(file, markdown)
 writeFileSync(join(root, 'digests', 'latest.md'), markdown)
+
+// macOS has no Markdown renderer, so the same digest is written as a styled
+// page that opens formatted in any browser.
+const html = toHtml(markdown, `Status digest, ${stamp(generatedAt)}`)
+writeFileSync(join(root, 'digests', `${stamp(generatedAt)}.html`), html)
+writeFileSync(join(root, 'digests', 'latest.html'), html)
 
 // Only a scheduled run advances the window, so on demand runs never eat tomorrow's news.
 if (advanceWindow) {
