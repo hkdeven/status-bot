@@ -75,9 +75,6 @@ function line (m) {
   return `- **${m.subject || '(no subject)'}**, ${who} (${clock(m.receivedDateTime)})${m.isRead ? '' : ' [unread]'}\n  ${preview}`
 }
 
-const ticketNumber = preview => /#(\d{3,})/.exec(preview || '')?.[1]
-const submitter = subject => /^(.*?)\s+has submitted a new ticket/i.exec(subject || '')?.[1]
-
 export async function collectOutlook ({ since, config, coverage = {} }) {
   if (!process.env.MS_CLIENT_ID) {
     return { title: 'Email (Outlook)', configured: false, setupHint: 'Add MS_CLIENT_ID and MS_TENANT_ID to .env.' }
@@ -118,7 +115,8 @@ export async function collectOutlook ({ since, config, coverage = {} }) {
   const body = []
   const attention = []
 
-  body.push(`${messages.length} message${messages.length === 1 ? '' : 's'} in the inbox for this window: ${buckets.needsYou.length} need you, ${buckets.fyi.length} for information, ${buckets.helpdesk.length} help desk, ${buckets.noise.length} automated, ${buckets.echo.length} already reported above.`)
+  // Help desk tickets are counted so the totals add up, and never listed.
+  body.push(`${messages.length} message${messages.length === 1 ? '' : 's'} in the inbox for this window: ${buckets.needsYou.length} need you, ${buckets.fyi.length} for information, ${buckets.helpdesk.length} help desk (ignored), ${buckets.noise.length} automated, ${buckets.echo.length} already reported above.`)
   body.push('')
 
   if (buckets.needsYou.length) {
@@ -134,21 +132,6 @@ export async function collectOutlook ({ since, config, coverage = {} }) {
       body.push(`- ${m.subject || '(no subject)'}, ${m.from?.emailAddress?.name || addr(m.from)} (${clock(m.receivedDateTime)})`)
     }
     if (buckets.fyi.length > 20) body.push(`- plus ${buckets.fyi.length - 20} more`)
-    body.push('')
-  }
-
-  if (buckets.helpdesk.length) {
-    body.push(`**Help desk queue**: ${buckets.helpdesk.length} new ticket${buckets.helpdesk.length === 1 ? '' : 's'}`)
-    for (const m of buckets.helpdesk.slice(0, 12)) {
-      const num = ticketNumber(m.bodyPreview)
-      const who = submitter(m.subject)
-      const label = who ? `${who}` : (m.subject || '(no subject)')
-      const gist = (m.bodyPreview || '').replace(/\s+/g, ' ')
-        .replace(/^.*?has been submitted by .*?\.\s*/i, '')
-        .replace(/^#\d+\s*/, '').slice(0, 90)
-      body.push(`- ${num ? `#${num} ` : ''}${label}: ${gist}`)
-    }
-    if (buckets.helpdesk.length > 12) body.push(`- plus ${buckets.helpdesk.length - 12} more`)
     body.push('')
   }
 
