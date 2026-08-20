@@ -21,10 +21,29 @@ const PLATFORM_SENDERS = {
   github: /@(.*\.)?github\.com$/i
 }
 
-// Help desk mail is addressed to him and unread, so it looks urgent to every
-// heuristic, but a queue of submitted tickets is a list to skim, not an inbox
-// of people waiting on a reply.
-const DEFAULT_HELPDESK = ['zohodesk\\.com', 'helpdesk@', 'servicedesk@']
+// Categories that are dropped before any urgency heuristic runs. They are
+// addressed to him and unread, so every heuristic would otherwise promote them.
+// Rules match sender and subject, never body text: a bare keyword like
+// "shipping" or "field service" also appears in real mail from colleagues.
+export const DEFAULT_IGNORE = [
+  { label: 'help desk', from: 'zohodesk\\.com|helpdesk@|servicedesk@' },
+  { label: 'incidents', from: 'no-reply@', subject: 'incident' },
+  { label: 'field service', from: 'no-reply@', subject: 'field service' },
+  { label: 'RFI', subject: '\\bRFI\\b' },
+  { label: 'shipping', subject: 'shipment|tracking number|freight|bill of lading|out for delivery|carrier|\\bBOL\\b' }
+]
+
+export function ignoreMatch (message, rules) {
+  const from = (message.from?.emailAddress?.address || '').toLowerCase()
+  const subject = message.subject || ''
+  for (const rule of rules) {
+    if (rule.from && !new RegExp(rule.from, 'i').test(from)) continue
+    if (rule.subject && !new RegExp(rule.subject, 'i').test(subject)) continue
+    if (!rule.from && !rule.subject) continue
+    return rule.label
+  }
+  return null
+}
 
 // GitHub subjects carry the repo, as in "[owner/repo] Something happened (#12)".
 const repoFromSubject = subject => /\[([\w.-]+\/[\w.-]+)\]/.exec(subject || '')?.[1]
@@ -101,22 +120,22 @@ export async function collectOutlook ({ since, config, coverage = {} }) {
   })
   const messages = res.value || []
 
-  const buckets = { needsYou: [], fyi: [], noise: [], echo: [], uncovered: [], helpdesk: [] }
+  const buckets = { needsYou: [], fyi: [], noise: [], echo: [], uncovered: [] }
   const suppress = config.outlook?.suppressCoveredNotifications !== false
-  const helpdesk = new RegExp((config.outlook?.helpdeskSenders || DEFAULT_HELPDESK).join('|'), 'i')
+  const rules = config.outlook?.ignoreRules || DEFAULT_IGNORE
   for (const m of messages) {
     const verdict = suppress ? echoVerdict(m, coverage) : null
     if (verdict === 'echo') { buckets.echo.push(m); continue }
     if (verdict === 'uncovered') { buckets.uncovered.push(m); continue }
-    if (helpdesk.test(addr(m.from))) { buckets.helpdesk.push(m); continue }
+    if (ignoreMatch(m, rules)) continue
     buckets[classify(m, mine)].push(m)
   }
 
   const body = []
   const attention = []
 
-  // Help desk tickets are counted so the totals add up, and never listed.
-  body.push(`${messages.length} message${messages.length === 1 ? '' : 's'} in the inbox for this window: ${buckets.needsYou.length} need you, ${buckets.fyi.length} for information, ${buckets.helpdesk.length} help desk (ignored), ${buckets.noise.length} automated, ${buckets.echo.length} already reported above.`)
+  // Ignored and automated mail is dropped silently: no list, no count, no mention.
+  body.push(`${buckets.needsYou.length} message${buckets.needsYou.length === 1 ? '' : 's'} need you, ${buckets.fyi.length} for information.`)
   body.push('')
 
   if (buckets.needsYou.length) {
@@ -158,17 +177,6 @@ export async function collectOutlook ({ since, config, coverage = {} }) {
     }
     const parts = [...byPlatform.entries()].map(([p, n]) => `${p} ${n}`).join(', ')
     body.push(`**Suppressed as duplicates**: ${buckets.echo.length} notification email${buckets.echo.length === 1 ? '' : 's'} (${parts}). Those changes are in the sections above.`)
-    body.push('')
-  }
-
-  if (buckets.noise.length) {
-    const bySender = new Map()
-    for (const m of buckets.noise) {
-      const who = m.from?.emailAddress?.name || addr(m.from) || 'unknown'
-      bySender.set(who, (bySender.get(who) || 0) + 1)
-    }
-    const top = [...bySender.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
-    body.push(`**Automated**: ${top.map(([who, n]) => `${who} (${n})`).join(', ')}`)
     body.push('')
   }
 

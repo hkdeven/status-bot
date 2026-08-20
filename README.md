@@ -72,10 +72,12 @@ Secrets live in `.env` and cached OAuth tokens in `.tokens/`. Both are gitignore
   sprint, default `SPRINT`. Sprint headings sort by the date in the tag name,
   so `21 AUGUST SPRINT` comes before `28 AUGUST SPRINT`, and anything without a
   sprint tag lands in one bucket at the end.
-- **Outlook**: inbox split into needs a reply, for information, and automated.
-  Help desk mail is dropped entirely, counted in the summary line and never
-  listed. It is addressed to you and unread, so every urgency heuristic would
-  otherwise promote it. `outlook.helpdeskSenders` decides what counts as one.
+- **Outlook**: only mail that needs a reply or is worth knowing about. Help desk
+  queues, incident notifications, Field Service digests, RFI mail, shipping
+  notices and anything automated are dropped silently, with no list and no
+  count. Rules live in `outlook.ignoreRules` and match on sender and subject
+  only, never body text, because words like "shipping" and "field service" also
+  appear in real mail from colleagues.
   Notification mail from Trello, Zoho and GitHub is dropped as a duplicate when
   that source already reported in the same digest, and counted in one line so
   you can see it happened. Two exceptions keep it visible: the source failed or

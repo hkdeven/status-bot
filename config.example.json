@@ -11,10 +11,29 @@
     ],
     "maxMessages": 100,
     "suppressCoveredNotifications": true,
-    "helpdeskSenders": [
-      "zohodesk\\.com",
-      "helpdesk@",
-      "servicedesk@"
+    "ignoreRules": [
+      {
+        "label": "help desk",
+        "from": "zohodesk\\.com|helpdesk@|servicedesk@"
+      },
+      {
+        "label": "incidents",
+        "from": "no-reply@",
+        "subject": "incident"
+      },
+      {
+        "label": "field service",
+        "from": "no-reply@",
+        "subject": "field service"
+      },
+      {
+        "label": "RFI",
+        "subject": "\\bRFI\\b"
+      },
+      {
+        "label": "shipping",
+        "subject": "shipment|tracking number|freight|bill of lading|out for delivery|carrier|\\bBOL\\b"
+      }
     ]
   },
   "trello": {
